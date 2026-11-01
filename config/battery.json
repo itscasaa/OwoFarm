@@ -1,0 +1,6 @@
+{
+    "enabled": false,
+    "minPercentage": 15,
+    "checkInterval": [240, 360],
+    "respectPlugged": true
+}

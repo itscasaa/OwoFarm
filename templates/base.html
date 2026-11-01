@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>Mizu Network - Dashboard</title>
+    <meta name="description" content="Mizu Network Dashboard - Advanced OwO Selfbot Control Panel">
+    
+    
+    <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='drawer.css') }}">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    </head>
+    <body>
+    
+    <div id="loading-screen" class="loading-screen">
+        <div class="loading-content">
+            <div class="loading-logo">
+                <i class="fas fa-water"></i>
+                <span>水 Network</span>
+            </div>
+            <div class="loading-spinner"></div>
+            <p>Loading Dashboard...</p>
+        </div>
+    </div>
+
+    
+    {% include "components/navbar.html" %}
+        
+    
+    <div class="drawer-backdrop" id="drawer-backdrop"></div>
+    
+    
+    <div class="main-container">
+        
+        {% include "components/sidebar.html" %}
+
+        
+        <main class="content-area">
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+
+    
+    <div id="notifications-container" class="notifications-container"></div>
+
+    
+    <div id="modal-container" class="modal-container"></div>
+
+    
+    {% include "components/footer.html" %}
+
+    
+    <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+    </body>
+</html>

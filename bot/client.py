@@ -1,0 +1,1129 @@
+
+import os
+import sys
+import json
+import time
+import random
+import asyncio
+import logging
+import traceback
+import itertools
+import requests
+import aiosqlite
+import aiohttp
+import pytz
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+
+try:
+    import discord
+    from discord.ext import commands, tasks
+except ImportError:
+    pass
+
+from utils import state
+from utils import helpers
+from utils.misspell import misspell_word, should_misspell
+from utils.headers import generate_headers
+from utils.watchdog import load_watchdog
+from utils.battery import load_battery
+from utils.error_report import ErrorReporter
+from cogs.comp import headers as comp_headers
+
+VERSION = "BETA 2.0"
+
+class MyClient(commands.Bot):
+
+    def __init__(self, token, channel_id, global_settings_dict, *args, **kwargs):
+        if 'intents' not in kwargs:
+            try:
+                if hasattr(discord, 'Intents'):
+                    intents = discord.Intents.default()
+                    intents.messages = True
+                    intents.guilds = True
+                    intents.message_content = True
+                    kwargs['intents'] = intents
+            except (AttributeError, Exception):
+                pass
+
+        super().__init__(command_prefix="-", self_bot=True, *args, **kwargs)
+        self.token = token
+        self.channel_id = int(channel_id)
+        self.list_channel = [self.channel_id]
+        self.session = None
+        self.state_event = asyncio.Event()
+        self.queue = asyncio.PriorityQueue()
+        self.settings_dict = None
+        self.global_settings_dict = global_settings_dict
+        self.commands_dict = {}
+        self.lock = asyncio.Lock()
+        self._global_send_lock = asyncio.Lock()
+        self._last_global_send_time = 0.0
+        self.cash_check = False
+        self.boss_channel_id = 0
+        self.local_headers = {}
+        self.hcaptcha_client = None
+        self.gain_or_lose = 0
+        self.checks = []
+        self.dm, self.cm = None,None
+        self.username = None
+        self.last_cmd_ran = None
+        self.reaction_bot_id = 519287796549156864
+        self.owo_bot_id = 408785106942164992
+        self.error_reporter = None
+        self.cmd_counter = itertools.count()
+        self.commands_sent_count = 0
+
+        self.random = random.Random()
+
+        self.user_status = {
+            "no_gems": False,
+            "no_cash": False,
+            "balance": 0,
+            "net_earnings": 0
+        }
+
+        self.command_handler_status = {
+            "state": True,
+            "captcha": False,
+            "sleep": False,
+            "hold_handler": False,
+            "rate_limited": False,
+            "battery": False
+        }
+
+        with open("config/misc.json", "r") as config_file:
+            self.misc = json.load(config_file)
+
+        self.alias = self.misc["alias"]
+
+        self.cmds_state = {
+            "global": {
+                "last_ran": 0
+            }
+        }
+        for key in self.misc["command_info"]:
+            self.cmds_state[key] = {
+                "in_queue": False,
+                "in_monitor": False,
+                "last_ran": 0
+            }
+
+    def get_nick(self, message):
+        if message.guild and message.guild.me:
+            return message.guild.me.display_name
+        return self.user.name
+
+    async def set_stat(self, value, debug_note=None):
+        if value:
+            self.command_handler_status["state"] = True
+            self.state_event.set()
+        else:
+            while not self.command_handler_status["state"]:
+                await self.state_event.wait()
+            self.command_handler_status["state"] = False
+            self.state_event.clear()
+
+    async def empty_checks_and_switch(self, channel):
+        self.command_handler_status["hold_handler"] = True
+        await self.sleep_till(self.settings_dict["channelSwitcher"]["delayBeforeSwitch"])
+        self.cm = channel
+        self.command_handler_status["hold_handler"] = False
+
+    @tasks.loop(seconds=30)
+    async def presence(self):
+        if self.status != discord.Status.invisible:
+            try:
+                await self.change_presence(
+                status=discord.Status.invisible, activity=self.activity
+            )
+                self.presence.stop()
+            except:
+                pass
+        else:
+            self.presence.stop()
+
+    @tasks.loop(seconds=5)
+    async def config_update_checker(self):
+        if state.config_updated and (time.time() - state.config_updated < 6):
+             await self.update_config()
+
+    @tasks.loop(seconds=1)
+    async def random_sleep(self):
+        sleep_dict = self.settings_dict.get("sleep", {})
+        if not sleep_dict.get("enabled", False) or sleep_dict.get("everyCommands"):
+            self.random_sleep.cancel()
+            return
+        check_cd = sleep_dict.get("checkTime", [10, 20])
+        check_val = self.random_float(check_cd) if isinstance(check_cd, (list, tuple)) else float(check_cd)
+        await asyncio.sleep(check_val * 60)
+        if self.random.randint(1, 100) > (100 - sleep_dict.get("frequencyPercentage", 50)):
+            await self.set_stat(False, "sleep")
+            raw_sleep = sleep_dict.get("sleeptime", 420)
+            sleep_time = self.random_float(raw_sleep) if isinstance(raw_sleep, (list, tuple)) else float(raw_sleep)
+            await self.log(f"sleeping for {sleep_time:.1f}s", "#87af87")
+            await asyncio.sleep(sleep_time)
+            await self.set_stat(True, "sleep stop")
+            await self.log("sleeping finished!", "#87af87")
+
+    @tasks.loop(seconds=7)
+    async def safety_check_loop(self):
+        pass
+
+    async def start_cogs(self):
+        files = os.listdir(helpers.resource_path("./cogs"))
+        self.random.shuffle(files)
+        self.refresh_commands_dict()
+        for filename in files:
+            if filename.endswith(".py"):
+
+                extension = f"cogs.{filename[:-3]}"
+                if extension in self.extensions:
+
+                    self.refresh_commands_dict()
+                    if not self.commands_dict[str(filename[:-3])]:
+                        await self.unload_cog(extension)
+                    continue
+                try:
+                    await asyncio.sleep(self.random_float(self.global_settings_dict["account"]["commandsStartDelay"]))
+                    if self.commands_dict.get(str(filename[:-3]), False):
+                        await self.load_extension(extension)
+
+                except Exception as e:
+                    await self.log(f"Error - Failed to load extension {extension}: {e}", "#c25560")
+
+        if "cogs.captcha" not in self.extensions:
+            await self.log(f"Error - Failed to load captcha extension,\nStopping code!!", "#c25560")
+            os._exit(0)
+
+    async def update_config(self):
+        async with self.lock:
+            custom_path = f"config/{self.user.id}.settings.json"
+            default_config_path = "config/settings.json"
+
+            config_path = custom_path if os.path.exists(custom_path) else default_config_path
+
+            with open(config_path, "r") as config_file:
+                self.settings_dict = json.load(config_file)
+
+            await self.start_cogs()
+
+    async def update_database(self, sql, params=None):
+        retries = 5
+        for i in range(retries):
+            try:
+                if not hasattr(self, 'db') or not self.db:
+                    async with aiosqlite.connect("utils/data/db.sqlite", timeout=30.0) as db:
+                        await db.execute("PRAGMA journal_mode=WAL;")
+                        await db.execute("PRAGMA synchronous=NORMAL;")
+                        await db.execute("BEGIN;")
+                        await db.execute(sql, params)
+                        await db.commit()
+                    return
+
+                await self.db.execute(sql, params)
+                await self.db.commit()
+                return
+            except Exception as e:
+                err_str = str(e).lower()
+                if "locked" in err_str and i < retries - 1:
+                    await asyncio.sleep(self.random.uniform(0.5, 2.0))
+                    continue
+                await self.log(f"Database error in update_database: {e}", "#c25560")
+                break
+
+    async def get_from_db(self, sql, params=None):
+        retries = 5
+        for i in range(retries):
+            try:
+                if not hasattr(self, 'db') or not self.db:
+                    async with aiosqlite.connect("utils/data/db.sqlite", timeout=30.0) as db:
+                        db.row_factory = aiosqlite.Row
+                        async with db.execute(sql, params or ()) as cursor:
+                            return await cursor.fetchall()
+
+                async with self.db.execute(sql, params or ()) as cursor:
+                    return await cursor.fetchall()
+            except Exception as e:
+                err_str = str(e).lower()
+                if "locked" in err_str and i < retries - 1:
+                    await asyncio.sleep(self.random.uniform(0.5, 2.0))
+                    continue
+                await self.log(f"Database error in get_from_db: {e}", "#c25560")
+                return []
+        return []
+
+    async def close(self):
+        if hasattr(self, 'db') and self.db:
+            await self.db.close()
+        await super().close()
+
+    async def update_cash_db(self):
+        hr = helpers.get_hour()
+
+        await self.update_database(
+            """UPDATE cowoncy_earnings
+            SET earnings = ?
+            WHERE user_id = ? AND hour = ?;""",
+            (self.user_status["net_earnings"], self.user.id, hr)
+        )
+
+        await self.update_database(
+            "UPDATE user_stats SET cowoncy = ? WHERE user_id = ?",
+            (self.user_status["balance"], self.user.id)
+        )
+
+    async def update_captcha_db(self):
+        await self.update_database(
+            "UPDATE user_stats SET captchas = captchas + 1 WHERE user_id = ?",
+            (self.user.id,)
+        )
+
+    async def populate_stats_db(self):
+        await self.update_database(
+            "INSERT OR IGNORE INTO user_stats (user_id, daily, lottery, cookie, giveaways, captchas, cowoncy) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (self.user.id, 0, 0, 0, 0, 0, 0)
+        )
+
+    async def populate_cowoncy_earnings(self, update=False):
+        today_str = helpers.get_date()
+
+        for i in range(24):
+            if not update:
+                await self.update_database(
+                    "INSERT OR IGNORE INTO cowoncy_earnings (user_id, hour, earnings) VALUES (?, ?, ?)",
+                    (self.user.id, i, 0)
+                )
+
+        rows = await self.get_from_db(
+            "SELECT value FROM meta_data WHERE key = ?", 
+            ("cowoncy_earnings_last_checked",)
+        )
+
+        last_reset_str = rows[0]['value'] if rows else "0"
+
+        if last_reset_str == today_str:
+            cur_hr = helpers.get_hour()
+            last_cash = 0
+            for hr in range(cur_hr+1):
+                hr_row = await self.get_from_db(
+                    "SELECT earnings FROM cowoncy_earnings WHERE user_id = ? AND hour = ?", 
+                    (self.user.id, hr)
+                )
+                if hr_row and hr_row[0]["earnings"] != 0:
+                    last_cash = hr_row[0]["earnings"]
+                elif last_cash != 0:
+                    await self.update_database(
+                        "UPDATE cowoncy_earnings SET earnings = ? WHERE hour = ? AND user_id = ?",
+                        (last_cash, hr, self.user.id)
+                    )
+            return
+
+        for i in range(24):
+            await self.update_database(
+                "UPDATE cowoncy_earnings SET earnings = 0 WHERE user_id = ? AND hour = ?",
+                (self.user.id, i)
+            )
+
+        await self.update_database(
+            "UPDATE meta_data SET value = ? WHERE key = ?",
+            (today_str, "cowoncy_earnings_last_checked")
+        )
+
+    async def fetch_net_earnings(self):
+        self.user_status["net_earnings"] = 0
+        rows = await self.get_from_db(
+            "SELECT earnings FROM cowoncy_earnings WHERE user_id = ? ORDER BY hour",
+            (self.user.id,)
+        )
+
+        cowoncy_list = [row["earnings"] for row in rows]
+
+        for item in reversed(cowoncy_list):
+            if item != 0:
+                self.user_status["net_earnings"] = item
+                break
+
+    async def reset_gamble_wins_or_losses(self):
+        today_str = helpers.get_date()
+
+        rows = await self.get_from_db(
+            "SELECT value FROM meta_data WHERE key = ?", 
+            ("gamble_winrate_last_checked",)
+        )
+
+        last_reset_str = rows[0]['value'] if rows else "0"
+
+        if last_reset_str == today_str:
+            return
+
+        for hour in range(24):
+            await self.update_database(
+                "UPDATE gamble_winrate SET wins = 0, losses = 0, net = 0 WHERE hour = ?",
+                (hour,)
+            )
+
+        await self.update_database(
+            "UPDATE meta_data SET value = ? WHERE key = ?",
+            (today_str, "gamble_winrate_last_checked")
+        )
+
+    async def update_cmd_db(self, cmd):
+        await self.update_database(
+            "UPDATE commands SET count = count + 1 WHERE name = ?",
+            (cmd,)
+        )
+
+    async def update_gamble_db(self, item="wins"):
+        hr = helpers.get_hour()
+
+        if item not in {"wins", "losses"}:
+            raise ValueError("Invalid column name.")
+
+        await self.update_database(
+            f"UPDATE gamble_winrate SET {item} = {item} + 1 WHERE hour = ?",
+            (hr,)
+        )
+
+    async def unload_cog(self, cog_name):
+        try:
+            if cog_name in self.extensions:
+                await self.unload_extension(cog_name)
+        except Exception as e:
+            await self.log(f"Error - Failed to unload cog {cog_name}: {e}", "#c25560")
+
+    def refresh_commands_dict(self):
+        commands_dict = self.settings_dict["commands"]
+        watchdog_config = load_watchdog()
+        battery_config = load_battery()
+        reaction_bot_dict = self.settings_dict["defaultCooldowns"]["reactionBot"]
+        huntbot_active = commands_dict["autoHuntBot"]["enabled"]
+
+        self.commands_dict = {
+            "autoenhance": self.settings_dict.get("autoEnhance", {}).get("enabled", False),
+            "autosell": self.settings_dict.get("autoSell", {}).get("enabled", False),
+            "battery": battery_config.get("enabled", False),
+            "battle": commands_dict["battle"]["enabled"] and not reaction_bot_dict["hunt_and_battle"] and not huntbot_active,
+            "boss": self.settings_dict.get("bossBattle", {}).get("enabled", False),
+            "captcha": True,
+            "channelswitcher": self.settings_dict.get("channelSwitcher", {}).get("enabled", False),
+            "chat": True,
+            "coinflip": self.settings_dict.get("gamble", {}).get("coinflip", {}).get("enabled", False),
+            "commands": True,
+            "cookie": commands_dict["cookie"]["enabled"],
+            "daily": self.settings_dict["autoDaily"],
+            "gems": self.settings_dict.get("autoUse", {}).get("gems", {}).get("enabled", False), 
+            "giveaway": self.settings_dict.get("giveawayJoiner", {}).get("enabled", False),
+            "hunt": commands_dict["hunt"]["enabled"] and not reaction_bot_dict["hunt_and_battle"] and not huntbot_active,
+            "huntbot": huntbot_active,
+            "level": commands_dict["lvlGrind"]["enabled"],
+            "looper": False,
+            "lottery": commands_dict["lottery"]["enabled"],
+            "others": self.settings_dict.get("autoUse", {}).get("autoCrate", False) or self.settings_dict.get("autoUse", {}).get("autoLootbox", False),
+            "owo": commands_dict["owo"]["enabled"] and not reaction_bot_dict["owo"],
+            "pray": (commands_dict["pray"]["enabled"] or commands_dict["curse"]["enabled"]) and not reaction_bot_dict["pray_and_curse"],
+            "quest": self.settings_dict.get("questTracker", {}).get("enabled", False),
+            "ratelimit": True,
+            "rpp": self.settings_dict.get("autoRandomCommands", {}).get("enabled", False),
+            "reactionbot": reaction_bot_dict["hunt_and_battle"] or reaction_bot_dict["owo"] or reaction_bot_dict["pray_and_curse"],
+            "richpresence": self.global_settings_dict.get("richPresence", {}).get("enabled", True),
+            "safety": self.settings_dict.get("safety", {}).get("enabled", False),
+            "sell": commands_dict["sell"]["enabled"],
+            "shop": commands_dict["shop"]["enabled"],
+            "slots": self.settings_dict.get("gamble", {}).get("slots", {}).get("enabled", False),
+            "customcommands": self.settings_dict.get("customCommands", {}).get("enabled", False),
+            "sleepsystem": self.settings_dict.get("sleep", {}).get("enabled", False),
+            "watchdog": watchdog_config.get("enabled", False),
+            "army": self.settings_dict.get("commands", {}).get("army", {}).get("enabled", False),
+            "mail": self.settings_dict.get("commands", {}).get("mail", {}).get("enabled", False),
+            "pupiku": self.settings_dict.get("commands", {}).get("pup", {}).get("enabled", False) or self.settings_dict.get("commands", {}).get("piku", {}).get("enabled", False),
+            "looper": False,
+        }
+
+    def add_dashboard_log(self, command_type, message, status="info"):
+        try:
+            log_entry = {
+                "timestamp": time.time(),
+                "account_id": str(self.user.id),
+                "account_display": self.username or (self.user.name if hasattr(self.user, 'name') else f"User-{str(self.user.id)[-4:]}") ,
+                "command_type": command_type,
+                "message": message,
+                "status": status
+            }
+            state.command_logs.append(log_entry)
+
+            if len(state.command_logs) > state.max_command_logs:
+                state.command_logs = state.command_logs[-state.max_command_logs:]
+        except Exception as e:
+            print(f"Error adding dashboard log: {e}")
+
+    def refresh_settings(self):
+        try:
+            settings_path = f"config/{self.user.id}/settings.json"
+            if os.path.exists(settings_path):
+                with open(settings_path, 'r') as f:
+                    new_settings = json.load(f)
+                self.settings_dict = new_settings
+                self.refresh_commands_dict()
+                asyncio.create_task(self.sync_cogs_with_settings())
+                print(f"Settings refreshed for user {self.user.id}")
+        except Exception as e:
+            print(f"Error refreshing settings for user {self.user.id}: {e}")
+
+    async def purge_from_queue(self, command_id):
+        try:
+            async with self.lock:
+                items = []
+                while not self.queue.empty():
+                    items.append(await self.queue.get())
+                for item in items:
+                    priority, counter, cmd = item
+                    if cmd.get('id') != command_id:
+                        await self.queue.put(item)
+                if command_id in self.cmds_state:
+                    self.cmds_state[command_id]["in_queue"] = False
+        except Exception as e:
+            await self.log(f"Error - purge_from_queue({command_id}): {e}", "#c25560")
+
+    async def sync_cogs_with_settings(self):
+        try:
+            self.refresh_commands_dict()
+            files = os.listdir(helpers.resource_path("./cogs"))
+            for filename in files:
+                if not filename.endswith('.py'):
+                    continue
+                key = filename[:-3]
+                extension = f"cogs.{key}"
+                should_enable = self.commands_dict.get(key, False)
+                if extension in self.extensions and not should_enable:
+                    await self.unload_cog(extension)
+                elif extension not in self.extensions and should_enable:
+                    try:
+                        await self.load_extension(extension)
+                    except Exception as e:
+                        await self.log(f"Error - Failed to load extension {extension}: {e}", "#c25560")
+        except Exception as e:
+            await self.log(f"Error - sync_cogs_with_settings(): {e}", "#c25560")
+
+    async def apply_toggle(self, command, enabled):
+        try:
+            await asyncio.sleep(0)
+            self.refresh_commands_dict()
+
+            if command == "useSlashCommands":
+                self.settings_dict["useSlashCommands"] = enabled
+                await self.log(f"Slash commands {'enabled' if enabled else 'disabled'}", "#40e0d0")
+                self.add_dashboard_log("system", f"Slash commands {'enabled' if enabled else 'disabled'}", "info")
+                return
+
+            if command == "channelSwitcher":
+                if "channelSwitcher" not in self.settings_dict or self.settings_dict["channelSwitcher"] is None:
+                    self.settings_dict["channelSwitcher"] = {
+                        "enabled": False, 
+                        "users": [], 
+                        "interval": [300, 600], 
+                        "delayBeforeSwitch": [2, 4]
+                    }
+
+                self.settings_dict["channelSwitcher"]["enabled"] = enabled
+                await self.log(f"Channel Switcher {'enabled' if enabled else 'disabled'}", "#9dc3f5")
+                self.add_dashboard_log("system", f"Channel Switcher {'enabled' if enabled else 'disabled'}", "info")
+
+                extension = 'cogs.channelswitcher'
+                if not enabled and extension in self.extensions:
+                    await self.unload_cog(extension)
+                    await self.log("Channel Switcher cog unloaded", "#ff6b6b")
+                elif enabled and extension not in self.extensions:
+                    try:
+                        await self.load_extension(extension)
+                        await self.log("Channel Switcher cog loaded", "#51cf66")
+                    except Exception as e:
+                        await self.log(f"Error - Failed to load Channel Switcher: {e}", "#c25560")
+                        self.add_dashboard_log("system", f"Failed to enable Channel Switcher: {e}", "error")
+                return
+
+            ext_map = {
+                'hunt': ('cogs.hunt', 'hunt', ['hunt']),
+                'battle': ('cogs.battle', 'battle', ['battle']),
+                'daily': ('cogs.daily', 'daily', ['daily']),
+                'owo': ('cogs.owo', 'owo', ['owo']),
+                'army': ('cogs.army', 'army', ['army']),
+                'mail': ('cogs.mail', 'mail', ['mail']),
+                'pup': ('cogs.pupiku', 'pupiku', ['pup', 'piku']),
+                'piku': ('cogs.pupiku', 'pupiku', ['pup', 'piku']),
+                'autoHuntBot': ('cogs.huntbot', 'huntbot', ['huntbot']),
+                'coinflip': ('cogs.coinflip', 'coinflip', ['coinflip']),
+                'slots': ('cogs.slots', 'slots', ['slots']),
+            }
+            mapped = ext_map.get(command)
+            if mapped:
+                extension, gate_key, queue_ids = mapped
+                gate = self.commands_dict.get(gate_key, False)
+                if command in ('pup', 'piku'):
+                    gate = self.commands_dict.get("pupiku", False)
+                if not enabled and extension in self.extensions:
+                    await self.unload_cog(extension)
+                    await self.log(f"{command.upper()} disabled", "#ff6b6b")
+                    self.add_dashboard_log("system", f"{command.upper()} disabled", "warning")
+                elif enabled and extension not in self.extensions and gate:
+                    try:
+                        await self.load_extension(extension)
+                        await self.log(f"{command.upper()} enabled", "#51cf66")
+                        self.add_dashboard_log("system", f"{command.upper()} enabled", "success")
+                    except Exception as e:
+                        await self.log(f"Error - Failed to load extension {extension}: {e}", "#c25560")
+                        self.add_dashboard_log("system", f"Failed to enable {command.upper()}: {e}", "error")
+                for qid in queue_ids:
+                    await self.remove_queue(id=qid)
+                    await self.purge_from_queue(qid)
+        except Exception as e:
+            await self.log(f"Error - apply_toggle({command}): {e}", "#c25560")
+            self.add_dashboard_log("system", f"Error toggling {command.upper()}: {e}", "error")
+
+    def random_float(self, cooldown_list):
+        if isinstance(cooldown_list, (int, float)):
+            return float(cooldown_list)
+        return self.random.uniform(cooldown_list[0], cooldown_list[1])
+
+    async def sleep_till(self, cooldown, cd_list=True, noise=3):
+        if isinstance(cooldown, (int, float)):
+            await asyncio.sleep(float(cooldown))
+        elif cd_list:
+            await asyncio.sleep(
+                self.random.uniform(cooldown[0], cooldown[1])
+            )
+        else:
+            await asyncio.sleep(
+                self.random.uniform(
+                    cooldown,
+                    cooldown + noise
+                )
+            )
+
+    async def upd_cmd_state(self, id, reactionBot=False):
+        async with self.lock:
+            self.cmds_state["global"]["last_ran"] = time.time()
+            self.cmds_state[id]["last_ran"] = time.time()
+            if not reactionBot:
+                self.cmds_state[id]["in_queue"] = False
+            await self.update_cmd_db(id)
+
+    def construct_command(self, data):
+        prefix = self.settings_dict['setprefix'] if data.get("prefix") else ""
+        return f"{prefix}{data['cmd_name']} {data.get('cmd_arguments', '')}".strip()
+
+    async def put_queue(self, cmd_data, priority=False, quick=False):
+        cnf = self.misc["command_info"]
+        try:
+            if not isinstance(cmd_data, dict) or "id" not in cmd_data:
+                await self.log(f"Error - Command data missing 'id' field. Data: {cmd_data}", "#c25560")
+                return
+
+            while (
+                not self.command_handler_status["state"]
+                or self.command_handler_status["hold_handler"]
+                or self.command_handler_status["sleep"]
+                or self.command_handler_status["captcha"]
+                or self.command_handler_status.get("rate_limited", False)
+                or self.command_handler_status.get("battery", False)
+            ):
+                if priority and (
+                    not self.command_handler_status["sleep"]
+                    and not self.command_handler_status["hold_handler"]
+                    and not self.command_handler_status["captcha"]
+                ):
+                    break
+                await asyncio.sleep(self.random.uniform(1.4, 2.9))
+
+            if self.cmds_state[cmd_data["id"]]["in_queue"]:
+                await self.log(f"Error - command with id: {cmd_data['id']} already in queue, being attempted to be added back.", "#c25560")
+                return
+
+            priority_int = cnf[cmd_data["id"]].get("priority") if not quick else 0
+            if not priority_int and priority_int!=0:
+                await self.log(f"Error - command with id: {cmd_data['id']} do not have a priority set in misc.json", "#c25560")
+                return
+
+            base_cd = cnf[cmd_data["id"]].get("basecd", 0)
+            elapsed = time.time() - self.cmds_state[cmd_data["id"]]["last_ran"]
+
+            remaining = base_cd - elapsed
+
+            if remaining > 0.5 and not quick:
+                 await self.log(f"⏳ Mizu Cooldown System: {cmd_data['id']} is on cooldown ({remaining:.1f}s left). Pausing...", "#555555")
+                 await asyncio.sleep(remaining + 0.5) 
+                 if not self.command_handler_status["state"]: 
+                     return
+
+            async with self.lock:
+                await self.queue.put((
+                    priority_int, 
+                    next(self.cmd_counter),
+                    deepcopy(cmd_data)
+                ))
+                self.cmds_state[cmd_data["id"]]["in_queue"] = True
+        except Exception as e:
+            await self.log(f"Error - {e}, during put_queue. Command data: {cmd_data}", "#c25560")
+
+    async def remove_queue(self, cmd_data=None, id=None):
+        if not cmd_data and not id:
+            await self.log(f"Error: No id or command data provided for removing item from queue.", "#c25560")
+            return
+        try:
+            async with self.lock:
+                for index, command in enumerate(self.checks):
+                    if cmd_data:
+                        if command == cmd_data:
+                            self.checks.pop(index)
+                    else:
+                        if command.get("id", None) == id:
+                            self.checks.pop(index)
+        except Exception as e:
+            await self.log(f"Error: {e}, during remove_queue", "#c25560")
+
+    async def search_checks(self, id):
+        async with self.lock:
+            for command in self.checks:
+                if command.get("id", None) == id:
+                    return True
+            return False
+
+    async def shuffle_queue(self):
+        async with self.lock:
+            items = []
+            while not self.queue.empty():
+                items.append(await self.queue.get())
+
+            self.random.shuffle(items)
+
+            for item in items:
+                await self.queue.put(item)
+
+    def add_popup_queue(self, channel_name, captcha_type=None):
+        pass
+
+    async def on_error(self, event_method, *args, **kwargs):
+        exc_type, exc_value, exc_tb = sys.exc_info()
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        error_type = exc_type.__name__ if exc_type else "Unknown"
+        message = str(exc_value) if exc_value else event_method
+
+        await self.log(f"Unhandled error in {event_method}: {error_type} - {message}", "#c25560")
+
+        if self.error_reporter:
+            try:
+                await self.error_reporter.report(error_type, message, tb_text)
+            except Exception as e:
+                await self.log(f"Error reporter failed: {e}", "#c25560")
+
+    async def log(self, text, color="#ffffff", bold=False, web_log=None, webhook_useless_log=None):
+        if web_log is None:
+            web_log = self.global_settings_dict["website"]["enabled"]
+        if webhook_useless_log is None:
+            webhook_useless_log = self.global_settings_dict["webhook"]["webhookUselessLog"]
+
+        current_time = datetime.now().strftime("%H:%M:%S")
+        if self.misc["debug"]["enabled"]:
+            frame_info = traceback.extract_stack()[-2]
+            filename = os.path.basename(frame_info.filename)
+            lineno = frame_info.lineno
+
+            content_to_print = f"[#676585]❲{current_time}❳[/#676585] {self.username} - {text} | [#676585]❲{filename}:{lineno}❳[/#676585]"
+            helpers.printBox(
+                content_to_print,
+                color,
+            )
+            if self.misc["debug"]["logInTextFile"]:
+                 logging.getLogger("bot").info(f"[{current_time}] {self.username} - {text}")
+        else:
+            helpers.printBox(f"{self.username}| {text}".center(helpers.console.size.width - 2), color)
+        if web_log:
+            with helpers.lock:
+                state.website_logs.append(f"<div class='message'><span class='timestamp'>[{current_time}]</span><span class='text'>{self.username}| {text}</span></div>")
+                if len(state.website_logs) > 300:
+                    state.website_logs.pop(0)
+        if webhook_useless_log:
+            await self.webhookSender(footer=f"[{current_time}] {self.username} - {text}", colors=color)
+
+    async def webhookSender(self, msg=None, desc=None, plain_text=None, colors=None, img_url=None, author_img_url=None, footer=None, webhook_url=None, title=None, description=None, author_name=None, **kwargs):
+        try:
+            target_url = webhook_url or self.global_settings_dict.get("webhook", {}).get("webhookCaptchaUrl") or self.global_settings_dict.get("webhook", {}).get("webhookUrl")
+            if not target_url or not self.global_settings_dict.get("webhook", {}).get("enabled", True):
+                return
+
+            main_title = msg or title or ""
+            main_desc = desc or description or ""
+
+            if colors:
+                if isinstance(colors, str) and colors.startswith("#"):
+                    color_int = int(colors.lstrip("#"), 16)
+                elif isinstance(colors, int):
+                    color_int = colors
+                else:
+                    try:
+                        color_int = int(colors)
+                    except Exception:
+                        color_int = 0x00D7AF
+            else:
+                color_int = 0x00D7AF
+
+            embed = {
+                "title": main_title,
+                "color": color_int,
+            }
+            if main_desc:
+                embed["description"] = main_desc
+            if footer:
+                embed["footer"] = {"text": str(footer)}
+            if img_url:
+                embed["thumbnail"] = {"url": img_url}
+            if author_img_url or author_name:
+                embed["author"] = {
+                    "name": author_name or self.username or "Mizu Bot",
+                    "icon_url": author_img_url or "https://cdn.discordapp.com/emojis/1171297031772438618.png"
+                }
+            embed["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+            if plain_text:
+                full_content = str(plain_text)
+            else:
+                content_lines = []
+                if main_title:
+                    content_lines.append(f"*{main_title}*")
+                if main_desc:
+                    content_lines.append(main_desc)
+                if footer:
+                    content_lines.append(f"_{footer}_")
+                full_content = "\n".join(content_lines)
+
+            payload = {
+                "username": "Mizu Network",
+                "avatar_url": "https://cdn.discordapp.com/emojis/1171297031772438618.png",
+                "content": full_content or main_title or "Notification",
+                "embeds": [embed]
+            }
+
+            if kwargs.get("message_id"):
+                payload["messageId"] = kwargs["message_id"]
+            if kwargs.get("edit_key"):
+                payload["editKey"] = kwargs["edit_key"]
+            if kwargs.get("clean", True):
+                payload["clean"] = True
+
+            resp_data = None
+            session = self.session if (self.session and not self.session.closed) else None
+            if session:
+                async with session.post(target_url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status in (200, 204):
+                        try:
+                            resp_data = await resp.json()
+                        except Exception:
+                            pass
+                    else:
+                        await self.log(f"Webhook HTTP {resp.status}", "#c25560")
+            else:
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(target_url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status in (200, 204):
+                            try:
+                                resp_data = await resp.json()
+                            except Exception:
+                                pass
+                        else:
+                            await self.log(f"Webhook HTTP {resp.status}", "#c25560")
+            return resp_data
+        except Exception as e:
+            await self.log(f"Error - {e}, during webhookSender.", "#c25560")
+
+    def calculate_correction_time(self, command):
+        command = command.replace(" ", "")
+        cnf = self.settings_dict.get("misspell", {})
+        base_delay = self.random_float(cnf.get("baseDelay", [0.03, 0.07]))
+        rectification_time = sum(
+            self.random_float(cnf.get("errorRectificationTimePerLetter", [0.04, 0.09]))
+            for _ in command
+        )
+        return base_delay + rectification_time
+
+    async def _handle_command_count_and_sleep(self):
+        self.commands_sent_count += 1
+        sleep_cfg = self.settings_dict.get("sleep", {}) if self.settings_dict else {}
+        every_cmds_cfg = sleep_cfg.get("everyCommands", 20) if sleep_cfg.get("enabled", True) else 20
+        if isinstance(every_cmds_cfg, (list, tuple)):
+            if not hasattr(self, "_target_cmd_count") or self._target_cmd_count is None:
+                self._target_cmd_count = random.randint(int(every_cmds_cfg[0]), int(every_cmds_cfg[1]))
+            target_cmds = self._target_cmd_count
+        else:
+            target_cmds = int(every_cmds_cfg)
+
+        if target_cmds > 0 and self.commands_sent_count >= target_cmds:
+            actual_sent = self.commands_sent_count
+            self.commands_sent_count = 0
+            if isinstance(every_cmds_cfg, (list, tuple)):
+                self._target_cmd_count = random.randint(int(every_cmds_cfg[0]), int(every_cmds_cfg[1]))
+
+            sleep_duration = sleep_cfg.get("sleeptime", 420)
+            if isinstance(sleep_duration, (list, tuple)):
+                duration_secs = int(self.random_float(sleep_duration))
+            else:
+                duration_secs = int(sleep_duration)
+
+            duration_mins = duration_secs / 60.0
+            self.command_handler_status["sleep"] = True
+            await self.log(f"💤 [{actual_sent}/{target_cmds}] Telah mengirim {actual_sent} command! Mengambil jeda tidur selama {duration_mins:.1f} menit ({duration_secs}s)...", "#60a5fa")
+            self.add_dashboard_log("system", f"Jeda berkala: tidur {duration_mins:.1f} menit setelah {actual_sent} command", "info")
+
+            # Webhook on jeda disabled per user preference (only alert on captcha)
+
+            await asyncio.sleep(duration_secs)
+            self.command_handler_status["sleep"] = False
+            self._last_global_send_time = asyncio.get_running_loop().time()
+            await self.log(f"⏰ Istirahat {duration_mins:.1f} menit selesai! Melanjutkan pengiriman command...", "#51cf66")
+            self.add_dashboard_log("system", f"Selesai istirahat {duration_mins:.1f} menit, bot kembali aktif", "success")
+
+    async def send(self, message, color=None, bypass=False, channel=None, silent=None, typingIndicator=None):
+        if silent is None:
+            silent = self.global_settings_dict["silentTextMessages"]
+        if typingIndicator is None:
+            typingIndicator = self.global_settings_dict["typingIndicator"]
+
+        disable_log = self.misc["console"]["disableCommandSendLog"]
+        msg = message
+        misspelled = False
+        if should_misspell(self.settings_dict):
+            msg = misspell_word(message)
+            misspelled = True
+
+        async with self._global_send_lock:
+            send_channel = channel or self.cm
+            if not send_channel:
+                return
+            now = asyncio.get_running_loop().time()
+            min_gap = self.random.uniform(2.4, 3.4)
+            elapsed = now - self._last_global_send_time
+            if elapsed < min_gap:
+                await asyncio.sleep(min_gap - elapsed)
+
+            if not self.command_handler_status["captcha"] or bypass:
+                await self.wait_until_ready()
+                if typingIndicator:
+
+                    char_length = len(msg)
+                    base_reaction = self.random.uniform(0.2, 0.4)
+                    typing_speed_variance = self.random.uniform(0.8, 1.2)
+                    estimated_typing_time = (char_length / 12.0) * typing_speed_variance
+
+                    total_delay = min(base_reaction + estimated_typing_time, 0.8)
+
+                    async with send_channel.typing():
+                        await asyncio.sleep(total_delay)
+                        await send_channel.send(msg, silent=silent)
+                else:
+                    await send_channel.send(msg, silent=silent)
+
+                self._last_global_send_time = asyncio.get_running_loop().time()
+                current_cnt = self.commands_sent_count + 1
+                if not disable_log:
+                    await self.log(f"[{current_cnt}/15] Ran: {msg}", color if color else "#5432a8")
+                if misspelled:
+                    await self.set_stat(False, "misspell")
+                    time_val = self.calculate_correction_time(message)
+                    await self.log(f"correcting: {msg} -> {message} in {time_val}s", "#422052")
+                    await asyncio.sleep(time_val)
+                    if typingIndicator:
+                        async with send_channel.typing():
+                            await send_channel.send(message, silent=silent)
+                    else:
+                        await send_channel.send(message, silent=silent)
+                    self._last_global_send_time = asyncio.get_running_loop().time()
+                    await self.set_stat(True, "misspell stop")
+
+                await self._handle_command_count_and_sleep()
+
+    async def slashCommandSender(self, msg, color, **kwargs):
+        try:
+            for command in self.slash_commands:
+                if command.name == msg:
+                    await self.wait_until_ready()
+                    await command(**kwargs)
+                    current_cnt = self.commands_sent_count + 1
+                    await self.log(f"[{current_cnt}/15] Ran: /{msg}", color if color else "#5432a8")
+                    await self._handle_command_count_and_sleep()
+        except Exception as e:
+            await self.log(f"Error: {e}, during slashCommandSender", "#c25560")
+
+    def calc_time(self):
+        pst_timezone = pytz.timezone('US/Pacific') 
+        current_time_pst = datetime.now(timezone.utc).astimezone(pst_timezone) 
+        midnight_pst = pst_timezone.localize(datetime(current_time_pst.year, current_time_pst.month, current_time_pst.day, 0, 0, 0)) 
+        time_until_12am_pst = midnight_pst + timedelta(days=1) - current_time_pst 
+        total_seconds = time_until_12am_pst.total_seconds() 
+        return total_seconds
+
+    def time_in_seconds(self):
+        time_now = datetime.now(timezone.utc).astimezone(pytz.timezone('US/Pacific'))
+        return time_now.timestamp()
+
+    async def check_for_cash(self):
+        await asyncio.sleep(self.random.uniform(4.5, 6.4))
+        await self.put_queue(
+            {
+                "cmd_name": self.alias["cash"]["normal"],
+                "prefix": True,
+                "checks": True,
+                "id": "cash",
+                "removed": False
+            }
+        )
+
+    async def update_cash(self, amount, override=False, reduce=False, assumed=False):
+        if override and self.settings_dict["cashCheck"]:
+            self.user_status["balance"] = amount
+        else:
+            if self.settings_dict["cashCheck"] and not assumed:
+                if reduce:
+                    self.user_status["balance"] -= amount
+                else:
+                    self.user_status["balance"] += amount
+
+            if reduce:
+                self.user_status["net_earnings"] -= amount
+            else:
+                self.user_status["net_earnings"] += amount
+
+        await self.update_cash_db()
+
+        if self.settings_dict.get("autoSell", {}).get("enabled", False):
+            try:
+                autosell_cog = self.get_cog("AutoSell")
+                if autosell_cog:
+                    await autosell_cog.check_balance_and_auto_sell()
+            except Exception as e:
+                await self.log(f"Error checking auto-sell: {e}", "#c25560")
+
+    async def setup_captcha_solver(self):
+        hcaptcha_cfg = self.global_settings_dict.get("captcha", {}).get("hcaptchaSolver", {})
+        if not hcaptcha_cfg.get("enabled") or not hcaptcha_cfg.get("apiKey"):
+            return
+
+        try:
+            self.local_headers = await generate_headers()
+            self.local_headers["Authorization"] = self.token
+
+            from captcha_solver.hcaptcha import HCaptchaSolver
+            self.hcaptcha_client = HCaptchaSolver(hcaptcha_cfg["apiKey"])
+
+            if self.hcaptcha_client.balance < 30:
+                await self.log(
+                    f"⚠️ hCaptcha solver enabled but low balance ({self.hcaptcha_client.balance})",
+                    "#ff9800",
+                )
+            else:
+                await self.log(
+                    f"🧩 hCaptcha solver ready (balance: {self.hcaptcha_client.balance})",
+                    "#00bcd4",
+                )
+        except Exception as e:
+            self.hcaptcha_client = None
+            await self.log(f"⚠️ Failed to init hCaptcha solver: {e}", "#ff9800")
+
+    async def setup_hook(self):
+        try:
+            self.db = await aiosqlite.connect("utils/data/db.sqlite", timeout=5)
+            self.db.row_factory = aiosqlite.Row
+            await self.db.execute("PRAGMA journal_mode=WAL;")
+            await self.db.execute("PRAGMA synchronous=NORMAL;")
+        except Exception as e:
+            print(f"Failed to connect to database: {e}")
+            self.db = None
+
+        if self.misc["debug"]["hideUser"]:
+            x = [
+                "Sunny", "River", "Echo", "Sky", "Shadow", "Nova", "Jelly", "Pixel",
+                "Cloud", "Mint", "Flare", "Breeze", "Dusty", "Blip"
+            ]
+            random_part = self.random.choice(x)
+            self.username = f"{random_part}_{abs(hash(str(self.user.id) + random_part)) % 10000}"
+        else:
+            self.username = self.user.name
+
+        self.safety_check_loop.start()
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+
+        error_report_config = self.global_settings_dict.get("webhook", {}).get("errorReport", {})
+        self.error_reporter = ErrorReporter(
+            error_report_config,
+            account_name=self.username,
+            version=VERSION,
+        )
+
+        await self.setup_captcha_solver()
+
+        helpers.printBox(f'-Loaded {self.username}[*].'.center(helpers.console.size.width - 2), 'bold royal_blue1 ')
+        state.list_user_ids.append(self.user.id)
+
+        self.cm = self.get_channel(self.channel_id)
+        if not self.cm:
+            try:
+                self.cm = await self.fetch_channel(self.channel_id)
+            except discord.NotFound:
+                await self.log(f"Error - Channel with ID {self.channel_id} does not exist.", "#c25560")
+                return
+            except discord.Forbidden:
+                await self.log(f"Bot lacks permissions to access channel {self.channel_id}.", "#c25560")
+                return
+            except discord.HTTPException as e:
+                await self.log(f"Failed to fetch channel {self.channel_id}: {e}", "#c25560")
+                return
+
+        self.slash_commands = []
+        try:
+            if hasattr(self.cm, 'application_commands'):
+                commands_found = await self.cm.application_commands()
+                for command in commands_found:
+                    if command.application.id == self.owo_bot_id:
+                        self.slash_commands.append(command)
+            else:
+                 await self.log("Warning: This discord.py version doesn't support slash command fetching. Slash commands disabled.", "#ff9800")
+        except Exception as e:
+            await self.log(f"Failed to fetch slash commands (Slash cmds disabled): {e}", "#ff9800")
+
+        self.default_config = {
+            self.user.id: {
+                "daily": 0,
+                "lottery": 0,
+                "cookie": 0,
+                "banned": [],
+                "giveaways": 0
+            }
+        }
+
+        with helpers.lock:
+            try:
+                with open("utils/stats.json", "r") as f:
+                    accounts_dict = json.load(f)
+            except:
+                accounts_dict = {}
+
+            if str(self.user.id) not in accounts_dict:
+                accounts_dict.update(self.default_config)
+                with open("utils/stats.json", "w") as f:
+                    json.dump(accounts_dict, f, indent=4)
+
+        await self.populate_stats_db()
+        await self.populate_cowoncy_earnings()
+        await self.reset_gamble_wins_or_losses()
+        await self.fetch_net_earnings()
+
+        await asyncio.sleep(self.random_float(self.global_settings_dict["account"]["startupDelay"]))
+        await self.update_config()
+
+        if self.global_settings_dict["offlineStatus"]:
+            self.presence.start()
+
+        if self.settings_dict["sleep"]["enabled"]:
+            self.random_sleep.start()
+
+        if self.settings_dict["cashCheck"]:
+            asyncio.create_task(self.check_for_cash())
